@@ -1,100 +1,162 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import plotly.express as px
-import io
 
-# -------- Constants --------
-MODULE_POWER_WP = 545.0
-MODULE_VOC = 49.91
-VMP_VOC_RATIO = 0.82
-NUM_STRINGS = 18
+# -------------------- PAGE CONFIG --------------------
+st.set_page_config(
+    page_title="SCB Current Analyzer",
+    layout="wide"
+)
 
-VMP = MODULE_VOC * VMP_VOC_RATIO
-I_MODULE_STC = MODULE_POWER_WP / VMP   # ≈ 13.3166 A
+st.title("🔌 SCB Current Analyzer – ITC Wise")
 
-CR_LOW_THRESHOLD = 0.90
+# -------------------- STATIC MASTER DATA --------------------
+# 👉 Replace / extend this using your reference Excel
+MASTER_DATA = pd.DataFrame([
+    {"ITC": "ITC-01", "Inverter": "INV-01", "SCB_ID": "SCB-01", "Strings": 18},
+    {"ITC": "ITC-01", "Inverter": "INV-01", "SCB_ID": "SCB-02", "Strings": 18},
+    {"ITC": "ITC-01", "Inverter": "INV-02", "SCB_ID": "SCB-03", "Strings": 20},
+    {"ITC": "ITC-02", "Inverter": "INV-01", "SCB_ID": "SCB-01", "Strings": 18},
+    {"ITC": "ITC-02", "Inverter": "INV-01", "SCB_ID": "SCB-02", "Strings": 18},
+])
 
-# -------- Functions --------
-def process_file(df):
-    # Assume: Col A = timestamp, Col B-S = strings, Col Y = irradiation
-    df = df.copy()
-    df.iloc[:,0] = pd.to_datetime(df.iloc[:,0])   # timestamp
-    df = df.set_index(df.columns[0])
+# -------------------- SIDEBAR --------------------
+st.sidebar.header("⚙️ Configuration")
 
-    measured_cols = df.columns[0:NUM_STRINGS]     # B..S
-    irr_col = df.columns[23]                      # Y
+# ITC Selection
+selected_itc = st.sidebar.selectbox(
+    "Select ITC",
+    sorted(MASTER_DATA["ITC"].unique())
+)
 
-    measured = df[measured_cols].astype(float)
-    irr = df[irr_col].astype(float)
+# Filter master data for selected ITC
+itc_master = MASTER_DATA[MASTER_DATA["ITC"] == selected_itc]
 
-    expected_str_current = I_MODULE_STC * (irr / 1000.0)
+st.sidebar.markdown("### 📂 Upload SCB Current Data")
+uploaded_file = st.sidebar.file_uploader(
+    "Upload Excel file",
+    type=["xlsx"]
+)
 
-    result = measured.copy()
-    for i,col in enumerate(measured_cols, start=1):
-        result[f"Expected_String_{i}"] = expected_str_current
-        result[f"CR_String_{i}"] = np.where(expected_str_current>0,
-                                            result[col]/expected_str_current,
-                                            np.nan)
+# -------------------- MAIN LOGIC --------------------
+if uploaded_file:
+    df_raw = pd.read_excel(uploaded_file)
 
-    result["Expected_SCB_Current"] = expected_str_current * NUM_STRINGS
-    result["Measured_SCB_Current"] = measured.sum(axis=1)
-    result["Irradiance_Wm2"] = irr
-    return result
+    st.subheader("🧭 Column Mapping")
 
-def plot_heatmap(df):
-    cr_cols = [c for c in df.columns if c.startswith("CR_String_")]
-    cr_matrix = df[cr_cols]
+    col1, col2 = st.columns(2)
 
-    fig, ax = plt.subplots(figsize=(14,6))
-    im = ax.imshow(cr_matrix.T, aspect='auto', origin='lower', vmin=0.0, vmax=1.4)
-    ax.set_yticks(np.arange(NUM_STRINGS))
-    ax.set_yticklabels([f"String {i+1}" for i in range(NUM_STRINGS)])
-    xticks = np.linspace(0, len(cr_matrix)-1, min(12, len(cr_matrix))).astype(int)
-    ax.set_xticks(xticks)
-    ax.set_xticklabels([df.index[i].strftime("%m-%d %H:%M") for i in xticks], rotation=45, ha='right')
-    ax.set_title("String Current Ratio Heatmap")
-    fig.colorbar(im, ax=ax, label="CR (Measured/Expected)")
-    st.pyplot(fig)
+    with col1:
+        scb_col = st.selectbox(
+            "Select SCB ID column",
+            df_raw.columns
+        )
 
-def daily_summary(df):
-    cr_cols = [c for c in df.columns if c.startswith("CR_String_")]
-    df2 = df[cr_cols].copy()
-    df2["date"] = df.index.date
-    grouped = df2.groupby("date")
+    with col2:
+        current_col = st.selectbox(
+            "Select ISC Current column",
+            df_raw.columns
+        )
 
-    rows = []
-    for date, grp in grouped:
-        weak = []
-        for i,c in enumerate(cr_cols, start=1):
-            frac = (grp[c]<CR_LOW_THRESHOLD).mean()
-            if frac > 0.3:   # 30% of the time weak
-                weak.append(f"String {i}")
-        rows.append({"date": date, "weak_strings": ", ".join(weak)})
-    return pd.DataFrame(rows)
+    if st.button("▶ Analyze SCBs"):
+        # -------------------- DATA MERGE --------------------
+        df = df_raw[[scb_col, current_col]].copy()
+        df.columns = ["SCB_ID", "ISC"]
 
-# -------- Streamlit UI --------
-st.title("SCB String Current Analysis Tool")
+        df["ISC"] = pd.to_numeric(df["ISC"], errors="coerce")
 
-file = st.file_uploader("Upload Excel file (with fixed format)", type=["xlsx"])
-if file:
-    df = pd.read_excel(file, engine="openpyxl")
-    result = process_file(df)
+        # Merge with static master
+        df = pd.merge(
+            itc_master,
+            df,
+            on="SCB_ID",
+            how="left"
+        )
 
-    st.subheader("Preview of Processed Data")
-    st.dataframe(result.head(20))
+        # -------------------- CALCULATIONS --------------------
+        df["I_norm"] = df["ISC"] / df["Strings"]
 
-    st.subheader("Heatmap of Current Ratio (CR)")
-    plot_heatmap(result)
+        # Peer Median (ITC + Inverter)
+        df["Peer_Median"] = df.groupby("Inverter")["I_norm"].transform("median")
 
-    st.subheader("Daily Summary of Weak Strings")
-    summary = daily_summary(result)
-    st.dataframe(summary)
+        # Deviation %
+        df["Deviation_%"] = ((df["I_norm"] - df["Peer_Median"]) /
+                              df["Peer_Median"]) * 100
 
-    # Download buttons
-    csv = result.reset_index().to_csv(index=False).encode("utf-8")
-    st.download_button("Download Processed CSV", csv, "processed_data.csv", "text/csv")
+        # Status Logic
+        def status_logic(x):
+            if pd.isna(x):
+                return "No Data"
+            elif x >= -2:
+                return "Normal"
+            elif x >= -5:
+                return "Watch"
+            elif x >= -10:
+                return "Underperforming"
+            else:
+                return "Critical"
 
-    csv2 = summary.to_csv(index=False).encode("utf-8")
-    st.download_button("Download Daily Summary", csv2, "daily_summary.csv", "text/csv")
+        df["Status"] = df["Deviation_%"].apply(status_logic)
+
+        # Rank inside inverter
+        df["Rank_in_Inverter"] = df.groupby("Inverter")["Deviation_%"] \
+                                     .rank(method="dense")
+
+        # Fault Hint
+        def fault_hint(row):
+            if pd.isna(row["ISC"]):
+                return "No current data"
+            if row["ISC"] < 0.5:
+                return "Fuse blown / string open"
+            if row["Deviation_%"] < -10:
+                return "Multiple strings / diode / PID"
+            if row["Deviation_%"] < -5:
+                return "Single string / connector issue"
+            return "Healthy"
+
+        df["Probable_Fault"] = df.apply(fault_hint, axis=1)
+
+        # -------------------- KPIs --------------------
+        st.subheader("📊 ITC Health Summary")
+
+        k1, k2, k3, k4 = st.columns(4)
+
+        k1.metric("Total SCBs", len(df))
+        k2.metric("Critical", (df["Status"] == "Critical").sum())
+        k3.metric("Underperforming", (df["Status"] == "Underperforming").sum())
+        k4.metric("No Data", (df["Status"] == "No Data").sum())
+
+        # -------------------- TABLE --------------------
+        st.subheader("📋 SCB Performance Table")
+
+        styled_df = df.sort_values("Deviation_%").style.applymap(
+            lambda v: "background-color:#ff4d4d" if v == "Critical"
+            else "background-color:#ffa64d" if v == "Underperforming"
+            else "background-color:#fff3cd" if v == "Watch"
+            else "background-color:#d4edda" if v == "Normal"
+            else "",
+            subset=["Status"]
+        )
+
+        st.dataframe(styled_df, use_container_width=True)
+
+        # -------------------- CHART --------------------
+        st.subheader("📉 Deviation Distribution")
+
+        st.bar_chart(
+            df["Deviation_%"].dropna(),
+            use_container_width=True
+        )
+
+        # -------------------- DOWNLOAD --------------------
+        st.subheader("⬇ Download Results")
+
+        output = df.copy()
+        st.download_button(
+            label="Download SCB Analysis Excel",
+            data=output.to_excel(index=False),
+            file_name=f"{selected_itc}_SCB_Analysis.xlsx"
+        )
+
+else:
+    st.info("⬅ Select ITC and upload SCB current data to begin analysis")
